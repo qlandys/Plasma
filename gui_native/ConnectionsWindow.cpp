@@ -38,8 +38,10 @@
 #include <QToolButton>
 #include <QUrl>
 #include <QCloseEvent>
+#include <QTcpSocket>
 
 static QString proxyUrlForEnv(const QString &proxyType, const QString &raw);
+static bool probeHttpProxyEndpoint(const QUrl &proxyUrl, int timeoutMs, QString *errOut);
 #include <QCursor>
 #include <QShowEvent>
 #include <QVBoxLayout>
@@ -3434,9 +3436,17 @@ void ConnectionsWindow::launchLighterSetup()
     st->outPath = outPath;
 
     const QString proxyEnvUrl = proxyUrlForEnv(lighterCreds.proxyType, lighterCreds.proxy);
+    bool proxyEnvOk = true;
+    QString proxyEnvErr;
+    if (!proxyEnvUrl.isEmpty()) {
+        const QUrl u(proxyEnvUrl);
+        if (!probeHttpProxyEndpoint(u, 1500, &proxyEnvErr)) {
+            proxyEnvOk = false;
+        }
+    }
 
-    auto applyProxyEnv = [proxyEnvUrl](QProcessEnvironment &env) {
-        if (proxyEnvUrl.isEmpty()) {
+    auto applyProxyEnv = [proxyEnvUrl, proxyEnvOk](QProcessEnvironment &env) {
+        if (proxyEnvUrl.isEmpty() || !proxyEnvOk) {
             return;
         }
         // Best-effort: many Python libs respect these for HTTP CONNECT proxies; SOCKS requires extra deps.
@@ -3448,7 +3458,7 @@ void ConnectionsWindow::launchLighterSetup()
         env.insert(QStringLiteral("all_proxy"), proxyEnvUrl);
     };
 
-    auto startStep = [proc, st, cfgDir, append, applyProxyEnv]() {
+    auto startStep = [proc, st, cfgDir, append, applyProxyEnv, proxyEnvOk, proxyEnvErr, proxyEnvUrl]() {
         if (st->step == 0) {
             if (QFile::exists(st->venvPython)) {
                 st->step = 1;
@@ -3472,6 +3482,11 @@ void ConnectionsWindow::launchLighterSetup()
             proc->setWorkingDirectory(cfgDir);
             QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
             applyProxyEnv(env);
+            if (!proxyEnvUrl.isEmpty() && !proxyEnvOk) {
+                append(QObject::tr("Proxy error: %1").arg(proxyEnvErr));
+                append(QObject::tr("This proxy endpoint does not look like an HTTP CONNECT proxy. If you selected SOCKS5, paste your provider's HTTP proxy endpoint instead."));
+                return;
+            }
             proc->setProcessEnvironment(env);
             proc->start(st->venvPython,
                         {QStringLiteral("-m"),
@@ -3693,6 +3708,60 @@ static QString proxyUrlForEnv(const QString &proxyType, const QString &raw)
         return make(parts[0].trimmed(), parts[1].trimmed(), parts[2].trimmed(), parts[3]);
     }
     return QString();
+}
+
+static bool probeHttpProxyEndpoint(const QUrl &proxyUrl, int timeoutMs, QString *errOut)
+{
+    auto setErr = [&](const QString &s) {
+        if (errOut) {
+            *errOut = s;
+        }
+    };
+    if (!proxyUrl.isValid() || proxyUrl.host().isEmpty() || proxyUrl.port() <= 0) {
+        setErr(QObject::tr("Invalid proxy URL"));
+        return false;
+    }
+
+    QTcpSocket sock;
+    QEventLoop loop;
+    QTimer timer;
+    timer.setSingleShot(true);
+
+    QObject::connect(&timer, &QTimer::timeout, &loop, [&]() { loop.quit(); });
+    QObject::connect(&sock, &QTcpSocket::connected, &loop, [&]() { loop.quit(); });
+    QObject::connect(&sock,
+                     qOverload<QAbstractSocket::SocketError>(&QTcpSocket::errorOccurred),
+                     &loop,
+                     [&]() { loop.quit(); });
+
+    sock.connectToHost(proxyUrl.host(), static_cast<quint16>(proxyUrl.port()));
+    timer.start(std::max(250, timeoutMs));
+    loop.exec();
+    if (sock.state() != QAbstractSocket::ConnectedState) {
+        setErr(QObject::tr("Proxy connect failed (%1)").arg(sock.errorString()));
+        return false;
+    }
+
+    // Minimal HTTP proxy preflight.
+    const QByteArray req =
+        QByteArrayLiteral("CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org:443\r\n\r\n");
+    sock.write(req);
+    sock.flush();
+
+    QObject::connect(&sock, &QTcpSocket::readyRead, &loop, [&]() { loop.quit(); });
+    timer.start(std::max(250, timeoutMs));
+    loop.exec();
+
+    const QByteArray peek = sock.peek(16);
+    if (peek.startsWith("HTTP/")) {
+        return true;
+    }
+    if (peek.isEmpty()) {
+        setErr(QObject::tr("Proxy did not respond with HTTP"));
+    } else {
+        setErr(QObject::tr("Proxy is not an HTTP proxy (got non-HTTP response)"));
+    }
+    return false;
 }
 
 #include "ConnectionsWindow.moc"
