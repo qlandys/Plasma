@@ -3479,9 +3479,7 @@ void ConnectionsWindow::launchLighterSetup()
                          QStringLiteral("install"),
                          QStringLiteral("--upgrade"),
                          QStringLiteral("pip"),
-                         QStringLiteral("lighter-sdk==1.0.2"),
-                         QStringLiteral("requests[socks]"),
-                         QStringLiteral("aiohttp-socks")});
+                         QStringLiteral("lighter-sdk==1.0.2")});
             return;
         }
         if (st->step == 2) {
@@ -3640,11 +3638,25 @@ static QString proxyUrlForEnv(const QString &proxyType, const QString &raw)
         return QString();
     }
     const QString t = proxyType.trimmed().toLower();
-    const QString scheme =
-        (t == QStringLiteral("socks5") || t == QStringLiteral("socks")) ? QStringLiteral("socks5")
-                                                                        : QStringLiteral("http");
+    // NOTE: Python tooling (pip) and many SDKs don't support SOCKS URLs in env vars without extra
+    // dependencies (e.g. PySocks). For reliability we always emit an HTTP CONNECT proxy URL.
+    // Most SOCKS providers also expose an HTTP proxy on the same endpoint.
+    Q_UNUSED(t);
+    const QString scheme = QStringLiteral("http");
     if (s.contains(QStringLiteral("://"))) {
-        return s;
+        const QUrl u(s);
+        if (!u.isValid() || u.host().isEmpty() || u.port() <= 0) {
+            return s;
+        }
+        // Re-encode as http://user:pass@host:port (even if input was socks5://...).
+        const QString host = u.host();
+        const int port = u.port();
+        const QString user = u.userName();
+        const QString pass = u.password();
+        if (!user.isEmpty()) {
+            return QStringLiteral("%1://%2:%3@%4:%5").arg(scheme, user, pass, host, QString::number(port));
+        }
+        return QStringLiteral("%1://%2:%3").arg(scheme, host, QString::number(port));
     }
     auto make = [&](const QString &host, const QString &port, const QString &user, const QString &pass) -> QString {
         if (host.isEmpty() || port.isEmpty()) {
