@@ -38,6 +38,8 @@
 #include <QToolButton>
 #include <QUrl>
 #include <QCloseEvent>
+
+static QString proxyUrlForEnv(const QString &proxyType, const QString &raw);
 #include <QCursor>
 #include <QShowEvent>
 #include <QVBoxLayout>
@@ -3431,13 +3433,31 @@ void ConnectionsWindow::launchLighterSetup()
     st->wizardPath = wizardPath;
     st->outPath = outPath;
 
-    auto startStep = [proc, st, cfgDir, append]() {
+    const QString proxyEnvUrl = proxyUrlForEnv(lighterCreds.proxyType, lighterCreds.proxy);
+
+    auto applyProxyEnv = [proxyEnvUrl](QProcessEnvironment &env) {
+        if (proxyEnvUrl.isEmpty()) {
+            return;
+        }
+        // Best-effort: many Python libs respect these for HTTP CONNECT proxies; SOCKS requires extra deps.
+        env.insert(QStringLiteral("HTTP_PROXY"), proxyEnvUrl);
+        env.insert(QStringLiteral("HTTPS_PROXY"), proxyEnvUrl);
+        env.insert(QStringLiteral("ALL_PROXY"), proxyEnvUrl);
+        env.insert(QStringLiteral("http_proxy"), proxyEnvUrl);
+        env.insert(QStringLiteral("https_proxy"), proxyEnvUrl);
+        env.insert(QStringLiteral("all_proxy"), proxyEnvUrl);
+    };
+
+    auto startStep = [proc, st, cfgDir, append, applyProxyEnv]() {
         if (st->step == 0) {
             if (QFile::exists(st->venvPython)) {
                 st->step = 1;
             } else {
             append(QObject::tr("Step 1/3: creating venv..."));
             proc->setWorkingDirectory(cfgDir);
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            applyProxyEnv(env);
+            proc->setProcessEnvironment(env);
             proc->start(QStringLiteral("python.exe"),
                         {QStringLiteral("-m"), QStringLiteral("venv"), st->venvDir});
             return;
@@ -3450,19 +3470,25 @@ void ConnectionsWindow::launchLighterSetup()
             }
             append(QObject::tr("Step 2/3: installing lighter-sdk into venv..."));
             proc->setWorkingDirectory(cfgDir);
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            applyProxyEnv(env);
+            proc->setProcessEnvironment(env);
             proc->start(st->venvPython,
                         {QStringLiteral("-m"),
                          QStringLiteral("pip"),
                          QStringLiteral("install"),
                          QStringLiteral("--upgrade"),
                          QStringLiteral("pip"),
-                         QStringLiteral("lighter-sdk==1.0.2")});
+                         QStringLiteral("lighter-sdk==1.0.2"),
+                         QStringLiteral("requests[socks]"),
+                         QStringLiteral("aiohttp-socks")});
             return;
         }
         if (st->step == 2) {
             append(QObject::tr("Step 3/3: running wizard..."));
             proc->setWorkingDirectory(cfgDir);
             QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            applyProxyEnv(env);
             if (st->useMnemonic) {
                 env.insert(QStringLiteral("LIGHTER_MNEMONIC"), st->mnemonic);
             } else {
@@ -3600,6 +3626,61 @@ void ConnectionsWindow::launchLighterSetup()
 
     dlg->show();
     appendLogMessage(tr("Opened Lighter setup dialog."));
+}
+
+static QString proxyUrlForEnv(const QString &proxyType, const QString &raw)
+{
+    const QString s = raw.trimmed();
+    if (s.isEmpty()) {
+        return QString();
+    }
+    if (s.compare(QStringLiteral("disabled"), Qt::CaseInsensitive) == 0
+        || s.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0
+        || s.compare(QStringLiteral("direct"), Qt::CaseInsensitive) == 0) {
+        return QString();
+    }
+    const QString t = proxyType.trimmed().toLower();
+    const QString scheme =
+        (t == QStringLiteral("socks5") || t == QStringLiteral("socks")) ? QStringLiteral("socks5")
+                                                                        : QStringLiteral("http");
+    if (s.contains(QStringLiteral("://"))) {
+        return s;
+    }
+    auto make = [&](const QString &host, const QString &port, const QString &user, const QString &pass) -> QString {
+        if (host.isEmpty() || port.isEmpty()) {
+            return QString();
+        }
+        if (!user.isEmpty()) {
+            return QStringLiteral("%1://%2:%3@%4:%5").arg(scheme, user, pass, host, port);
+        }
+        return QStringLiteral("%1://%2:%3").arg(scheme, host, port);
+    };
+
+    if (s.contains(QLatin1Char('@'))) {
+        const QStringList parts = s.split(QLatin1Char('@'));
+        if (parts.size() != 2) {
+            return QString();
+        }
+        const QStringList up = parts[0].split(QLatin1Char(':'), Qt::KeepEmptyParts);
+        const QStringList hp = parts[1].split(QLatin1Char(':'), Qt::KeepEmptyParts);
+        if (hp.size() != 2) {
+            return QString();
+        }
+        const QString host = hp[0].trimmed();
+        const QString port = hp[1].trimmed();
+        const QString user = up.size() >= 1 ? up[0].trimmed() : QString();
+        const QString pass = up.size() >= 2 ? up[1] : QString();
+        return make(host, port, user, pass);
+    }
+
+    const QStringList parts = s.split(QLatin1Char(':'), Qt::KeepEmptyParts);
+    if (parts.size() == 2) {
+        return make(parts[0].trimmed(), parts[1].trimmed(), QString(), QString());
+    }
+    if (parts.size() == 4) {
+        return make(parts[0].trimmed(), parts[1].trimmed(), parts[2].trimmed(), parts[3]);
+    }
+    return QString();
 }
 
 #include "ConnectionsWindow.moc"
